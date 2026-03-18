@@ -85,7 +85,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $stmt->bind_result($storedUsername, $storedPassword);
             $stmt->fetch();
 
-            if (password_verify($loginPassword, $storedPassword)) {
+            if (is_string($storedPassword) && password_verify($loginPassword, $storedPassword)) {
                 login_user($storedUsername, 'customer');
                 $stmt->close();
                 redirect('index.php');
