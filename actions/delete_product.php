@@ -1,23 +1,26 @@
 <?php
-include '../config/db_connection.php';
+require_once __DIR__ . '/../includes/bootstrap.php';
 
-if ($_SERVER["REQUEST_METHOD"] == "POST") {
-    $product_id = $_POST['product_id'];
+require_admin('../LoginSignup.php');
 
-    $sql = "DELETE FROM product WHERE id=$product_id";
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    $productId = (int) ($_POST['product_id'] ?? 0);
 
-    if ($conn->query($sql) === TRUE) {
-        echo "Product deleted successfully";
-    } else {
-        echo "Error: " . $sql . "<br>" . $conn->error;
+    if ($productId <= 0) {
+        set_flash('error', 'Invalid product selected.');
+        redirect('../AdminHome.php');
     }
 
-    $conn->close();
+    $stmt = $conn->prepare('DELETE FROM product WHERE id = ?');
+    $stmt->bind_param('i', $productId);
+
+    if ($stmt->execute()) {
+        set_flash('success', 'Product deleted successfully.');
+    } else {
+        set_flash('error', 'Unable to delete product.');
+    }
+
+    $stmt->close();
 }
 
-// Add this at the end of the file
-header("Location: ../AdminHome.php?success=delete");
-exit();
-
-?>
-
+redirect('../AdminHome.php');

@@ -1,14 +1,18 @@
 <?php
-$servername = "localhost";
-$username = "root";
-$password = ""; // Update with your database password
-$dbname = "siticookies";
+mysqli_report(MYSQLI_REPORT_OFF);
 
-// Create connection
-$conn = new mysqli($servername, $username, $password, $dbname);
+$servername = getenv('DB_HOST') ?: '127.0.0.1';
+$username = getenv('DB_USERNAME') ?: 'root';
+$password = getenv('DB_PASSWORD') ?: '';
+$dbname = getenv('DB_NAME') ?: 'siticookies';
+$port = (int) (getenv('DB_PORT') ?: 3306);
 
-// Check connection
-if ($conn->connect_error) {
-    die("Connection failed: " . $conn->connect_error);
+$conn = @new mysqli($servername, $username, $password, $dbname, $port);
+
+if ($conn->connect_errno) {
+    error_log('Database connection failed: ' . $conn->connect_error);
+    http_response_code(500);
+    exit('A database error occurred. Please check that MySQL is running and try again.');
 }
-?>
+
+$conn->set_charset('utf8mb4');

@@ -1,106 +1,121 @@
 <?php
-session_start();
+require_once __DIR__ . '/includes/store.php';
+require_once __DIR__ . '/includes/layout.php';
 
-// Set the time zone to Malaysia Time (MYT)
-date_default_timezone_set('Asia/Kuala_Lumpur');
-
-ini_set('display_errors', 1);
-ini_set('display_startup_errors', 1);
-error_reporting(E_ALL);
-
-include __DIR__ . '/config/db_connection.php';
-
-// Adding product to cart
-if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['product_id'])) {
-    $product_id = $_POST['product_id'];
-
-    $query = "SELECT * FROM product WHERE id = ?";
-    $stmt = $conn->prepare($query);
-    $stmt->bind_param("i", $product_id);
-    $stmt->execute();
-    $result = $stmt->get_result();
-
-    if ($result->num_rows > 0) {
-        $product = $result->fetch_assoc();
-        $product['quantity'] = 1; // Default quantity if not provided
-        $_SESSION['cart'][] = $product;
-    }
-}
-
-// Removing product from cart
 if (isset($_GET['remove_id'])) {
-    $remove_id = $_GET['remove_id'];
-    foreach ($_SESSION['cart'] as $key => $item) {
-        if ($item['id'] == $remove_id) {
-            unset($_SESSION['cart'][$key]);
-            break;
-        }
-    }
+    remove_from_cart((int) $_GET['remove_id']);
+    set_flash('success', 'Item removed from cart.');
+    redirect('Checkout.php');
 }
 
-// Placing order
-if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['place_order'])) {
-    $username = $_SESSION['username'];
-    $products = $_SESSION['cart'];
-    $address = htmlspecialchars($_POST['address']);
-    $state = htmlspecialchars($_POST['state']);
-    $postcode = htmlspecialchars($_POST['postcode']);
-    $city = htmlspecialchars($_POST['city']);
-    $time_order = date('Y-m-d H:i:s');
-    $payment_method = htmlspecialchars($_POST['payment']);
-    $total = $_POST['total'];
+$cartItems = refresh_cart_products($conn);
 
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['place_order'])) {
+    require_login('LoginSignup.php');
+
+    $address = trim($_POST['address'] ?? '');
+    $state = trim($_POST['state'] ?? '');
+    $postcode = trim($_POST['postcode'] ?? '');
+    $city = trim($_POST['city'] ?? '');
+    $paymentMethod = trim($_POST['payment'] ?? '');
+    $allowedPayments = ['Cash On Delivery', 'Online Banking'];
+
+    if ($address === '' || $state === '' || $postcode === '' || $city === '') {
+        set_flash('error', 'Please fill in all address fields.');
+        redirect('Checkout.php');
+    }
+
+    if (!in_array($paymentMethod, $allowedPayments, true)) {
+        set_flash('error', 'Please choose a valid payment method.');
+        redirect('Checkout.php');
+    }
+
+    $selection = build_checkout_selection($conn, parse_cart_state($_POST['cart_state'] ?? null));
+    $orderItems = $selection['items'];
+
+    if ($orderItems === []) {
+        set_flash('error', 'Please select at least one item to place an order.');
+        redirect('Checkout.php');
+    }
+
+    $subtotal = $selection['subtotal'];
+    $shipping = $selection['shipping'];
+    $tax = $selection['tax'];
+    $total = $subtotal + $shipping + $tax;
     $receipt = '';
-    if (isset($_FILES['receipt']) && $_FILES['receipt']['error'] == UPLOAD_ERR_OK) {
-        $upload_dir = __DIR__ . '/assets/uploads/';
-        if (!is_dir($upload_dir)) {
-            mkdir($upload_dir, 0777, true);
-        }
-        $receipt_name = basename($_FILES['receipt']['name']);
-        $receipt_path = $upload_dir . $receipt_name;
-        if (move_uploaded_file($_FILES['receipt']['tmp_name'], $receipt_path)) {
-            $receipt = $conn->real_escape_string('assets/uploads/' . $receipt_name);
-        } else {
-            die("Error uploading file.");
+
+    if ($paymentMethod === 'Online Banking') {
+        try {
+            $receipt = store_receipt_upload($_FILES['receipt'] ?? []);
+        } catch (RuntimeException $exception) {
+            set_flash('error', $exception->getMessage());
+            redirect('Checkout.php');
         }
     }
 
-    $conn->begin_transaction(); // Start transaction
+    $conn->begin_transaction();
 
     try {
-        // Insert into orders table
-        $stmt = $conn->prepare("INSERT INTO orders (username, address, state, postcode, city, time_order, payment_method, receipt, total) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)");
-        $stmt->bind_param("ssssssssd", $username, $address, $state, $postcode, $city, $time_order, $payment_method, $receipt, $total);
-        if (!$stmt->execute()) {
-            throw new Exception("Error executing query: " . $stmt->error);
+        $timeOrder = date('Y-m-d H:i:s');
+        $username = (string) current_user();
+        $status = 'Pending';
+
+        $orderStmt = $conn->prepare('INSERT INTO orders (username, address, state, postcode, city, time_order, payment_method, receipt, total, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)');
+        $orderStmt->bind_param('ssssssssds', $username, $address, $state, $postcode, $city, $timeOrder, $paymentMethod, $receipt, $total, $status);
+
+        if (!$orderStmt->execute()) {
+            throw new RuntimeException('Unable to save the order.');
         }
 
-        $order_id = $conn->insert_id; // Get the inserted order ID
+        $orderId = $conn->insert_id;
+        $orderStmt->close();
 
-        // Insert into order_items table
-        $stmt = $conn->prepare("INSERT INTO order_items (order_id, product, quantity) VALUES (?, ?, ?)");
-        foreach ($products as $product) {
-            $product_name = $product['name_product'];
-            $quantity = isset($product['quantity']) ? $product['quantity'] : 1; // Get quantity from cart or default to 1
-            $stmt->bind_param("isi", $order_id, $product_name, $quantity);
-            if (!$stmt->execute()) {
-                throw new Exception("Error executing query: " . $stmt->error);
+        $itemStmt = $conn->prepare('INSERT INTO order_items (order_id, product, quantity) VALUES (?, ?, ?)');
+        $stockStmt = $conn->prepare('UPDATE product SET quantity = quantity - ? WHERE id = ? AND quantity >= ?');
+
+        foreach ($orderItems as $item) {
+            $productName = $item['name_product'];
+            $quantity = (int) $item['quantity'];
+            $productId = (int) $item['id'];
+
+            $itemStmt->bind_param('isi', $orderId, $productName, $quantity);
+            if (!$itemStmt->execute()) {
+                throw new RuntimeException('Unable to save order items.');
+            }
+
+            $stockStmt->bind_param('iii', $quantity, $productId, $quantity);
+            $stockStmt->execute();
+            if ($stockStmt->affected_rows !== 1) {
+                throw new RuntimeException('One or more products no longer have enough stock.');
             }
         }
 
-        $conn->commit(); // Commit transaction
+        $itemStmt->close();
+        $stockStmt->close();
+        $conn->commit();
 
-        unset($_SESSION['cart']);
-        header("Location: OrderSuccess.php");
-        exit();
-    } catch (Exception $e) {
-        $conn->rollback(); // Rollback transaction if any query fails
-        die("Transaction failed: " . $e->getMessage());
+        $cartState = parse_cart_state($_POST['cart_state'] ?? null);
+        $remainingCart = [];
+        foreach (refresh_cart_products($conn) as $item) {
+            $productId = (int) $item['id'];
+            if (($cartState[$productId]['selected'] ?? true) === false) {
+                $item['quantity'] = min((int) $item['quantity'], (int) $item['stock']);
+                $remainingCart[] = $item;
+            }
+        }
+        set_cart($remainingCart);
+
+        set_flash('success', 'Order placed successfully.');
+        redirect('OrderSuccess.php');
+    } catch (RuntimeException $exception) {
+        $conn->rollback();
+        set_flash('error', $exception->getMessage());
+        redirect('Checkout.php');
     }
 }
-?>
 
-<script src="https://ajax.googleapis.com/ajax/libs/jquery/3.5.1/jquery.min.js"></script>
+$cartItems = refresh_cart_products($conn);
+?>
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -117,30 +132,34 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['place_order'])) {
             color: #333;
         }
 
+        header, footer {
+            background-color: #F1E8DA;
+            padding: 20px;
+        }
+
         header {
             display: flex;
             justify-content: space-between;
             align-items: center;
-            padding: 20px;
-            background-color: #F1E8DA;
         }
 
-        header .logo {
+        header .logo img,
+        footer .footer-content img {
+            height: 40px;
+            margin-left: 25px;
+        }
+
+        header nav ul,
+        footer .footer-content {
             display: flex;
             align-items: center;
-        }
-
-        header .logo img {
-            height: 40px;
-            margin-right: 10px;
-            margin-left: 25px;
+            justify-content: space-between;
+            margin: 0;
+            padding: 0;
         }
 
         header nav ul {
             list-style: none;
-            display: flex;
-            margin: 0;
-            padding: 0;
         }
 
         header nav ul li {
@@ -154,201 +173,142 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['place_order'])) {
             font-size: 14px;
         }
 
-        header nav ul li a.login-signup {
+        .login-signup,
+        .continue-btn,
+        .quantity-button,
+        .remove-button,
+        .submit-button,
+        button {
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+        }
+
+        .login-signup {
             background-color: #000;
             color: #fff;
             padding: 11px 25px;
-            border-radius: 5px;
             font-size: 10px;
         }
 
-        .checkout-title {
-            text-align: center;
-            font-size: 24px;
-            margin: 20px 0;
+        .checkout-layout {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 24px 20px 50px;
+            display: grid;
+            grid-template-columns: minmax(0, 2fr) minmax(320px, 1fr);
+            gap: 24px;
         }
 
-        .products {
-            display: flex;
-            flex-direction: column;
-            gap: 10px;
-            padding: 0 20px;
+        .panel {
+            background: #fff;
+            border-radius: 14px;
+            box-shadow: 0 8px 20px rgba(0, 0, 0, 0.08);
+            padding: 20px;
         }
 
         .product-item {
-            display: flex;
+            display: grid;
+            grid-template-columns: 24px 72px 1fr auto auto;
+            gap: 12px;
             align-items: center;
-            background-color: white;
-            padding: 10px;
-            border-radius: 10px;
-            box-shadow: 0 0 5px rgba(0, 0, 0, 0.1);
+            padding: 14px 0;
+            border-bottom: 1px solid #eee;
+        }
+
+        .product-item:last-child {
+            border-bottom: none;
         }
 
         .product-item img {
-            height: 50px;
-            margin-right: 10px;
-            margin-left: 15px;
-        }
-
-        .product-info {
-            flex-grow: 1;
-        }
-
-        .product-title {
-            font-size: 16px;
-            font-weight: bold;
+            width: 72px;
+            height: 72px;
+            object-fit: cover;
+            border-radius: 10px;
         }
 
         .product-description {
-            font-size: 14px;
-            color: gray;
-        }
-
-        .product-price {
-            font-size: 14px;
-            font-weight: bold;
-            margin-right: 10px;
+            color: #7a7a7a;
+            font-size: 13px;
+            margin-top: 6px;
         }
 
         .quantity-input {
             display: flex;
             align-items: center;
+            gap: 8px;
         }
 
-        .quantity-input button {
-            background-color: #d6c4aa;
-            color: white;
-            border: none;
-            padding: 5px 10px;
-            cursor: pointer;
-            border-radius: 5px;
-            font-weight: bold;
-            margin: 0 5px;
+        .quantity-button,
+        .remove-button,
+        .submit-button,
+        .continue-btn,
+        button {
+            background-color: #000;
+            color: #fff;
+            padding: 10px 14px;
+        }
+
+        .quantity-input input,
+        .address-grid input,
+        .payment-method label,
+        .upload-group input {
+            border: 1px solid #ccc;
+            border-radius: 8px;
+            padding: 10px;
         }
 
         .quantity-input input {
-            width: 40px;
-            padding: 8px;
-            border-radius: 5px;
-            border: 1px solid #ccc;
+            width: 64px;
             text-align: center;
-            margin: 0 3px;
         }
 
-        .order-summary {
-            background-color: white;
-            padding: 20px;
-            border-radius: 10px;
-            box-shadow: 0 0 5px rgba(0, 0, 0, 0.1);
-            margin: 20px;
+        .remove-button {
+            background-color: #9F2D2D;
+            text-decoration: none;
+            display: inline-block;
         }
 
-        .order-summary h3 {
-            margin-top: 0;
-        }
-
-        .order-summary div {
+        .summary-row {
             display: flex;
             justify-content: space-between;
-            margin-bottom: 10px;
+            margin-bottom: 12px;
         }
 
-        .continue-btn {
-            background-color: #F1E8DA;
-            color: black;
-            border: none;
-            padding: 10px 20px;
-            cursor: pointer;
+        .address-grid {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 12px;
+            margin-top: 16px;
+        }
+
+        .address-grid input {
             width: 100%;
-            border-radius: 10px;
-            font-weight: bold;
-        }
-
-        .address, .payment-method {
-            display: flex;
-            flex-wrap: wrap;
-            justify-content: space-between;
-            padding: 0 20px;
-            margin: 20px 0;
-        }
-
-        .address input, .payment-method input, .payment-method label {
-            width: calc(50% - 10px);
-            padding: 12px;
-            border-radius: 8px;
-            border: 1px solid #ccc;
-            margin-bottom: 10px;
             box-sizing: border-box;
+        }
+
+        .payment-method {
+            margin-top: 20px;
+            display: grid;
+            gap: 10px;
         }
 
         .payment-method label {
             display: flex;
             align-items: center;
-            cursor: pointer;
-            font-size: 14px;
-            margin-bottom: 5px;
-            font-weight: bold;
+            gap: 10px;
             background-color: #F1E8DA;
-        }
-
-        .payment-method input[type="radio"] {
-            margin-right: 5px;
         }
 
         .instructions {
-            display: none; /* Hide by default */
-            margin: 20px;
-            background-color: white;
-            padding: 20px;
+            display: none;
+            margin-top: 18px;
+            background-color: #FCF7F0;
             border-radius: 10px;
-            box-shadow: 0 0 5px rgba(0, 0, 0, 0.1);
+            padding: 16px;
         }
 
-        .instructions h2 {
-            margin-top: 0;
-        }
-
-        .instructions p {
-            margin: 10px 0;
-        }
-
-        footer {
-            background-color: #F1E8DA;
-            padding: 20px;
-            text-align: center;
-            margin-top: 20px;
-        }
-
-        footer .footer-content {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-        }
-
-        footer .footer-content span {
-            font-weight: 200;
-            font-style: italic;
-            color: #828282;
-            font-size: 12px;
-        }
-
-        footer .footer-content img {
-            height: 40px;
-            margin-left: 25px;
-        }
-
-        footer .footer-content .social-icons img {
-            height: 30px;
-            margin-left: 0px;
-            margin-right: 0px;
-        }
-
-        /* Styles for selected product item */
-        .product-checked {
-            background-color: #FCE8D8; /* Example background color for selected product */
-        }
-
-                .dropdown {
+        .dropdown {
             position: relative;
             display: inline-block;
         }
@@ -357,12 +317,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['place_order'])) {
             display: none;
             position: absolute;
             left: 50%;
-            transform: translateX(-50%); /* Center the dropdown */
+            transform: translateX(-50%);
             background-color: #F1E8DA;
-            min-width: 60px;
+            min-width: 90px;
             box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
             z-index: 1;
-            margin-top: 10px; /* Adjust this value for desired spacing */
+            margin-top: 10px;
         }
 
         .dropdown-content a {
@@ -372,33 +332,29 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['place_order'])) {
             display: block;
         }
 
-        .dropdown-content a:hover {
-            background-color: #ddd;
-        }
-
         .dropdown:hover .dropdown-content {
             display: block;
         }
 
         .modal {
-            display: none; /* Hidden by default */
-            position: fixed; /* Stay in place */
-            z-index: 1; /* Sit on top */
+            display: none;
+            position: fixed;
+            z-index: 1;
             left: 0;
             top: 0;
-            width: 100%; /* Full width */
-            height: 100%; /* Full height */
-            overflow: auto; /* Enable scroll if needed */
-            background-color: rgb(0,0,0); /* Fallback color */
-            background-color: rgba(0,0,0,0.4); /* Black w/ opacity */
+            width: 100%;
+            height: 100%;
+            overflow: auto;
+            background-color: rgba(0,0,0,0.4);
         }
 
         .modal-content {
             background-color: #fefefe;
-            margin: 15% auto; /* 15% from the top and centered */
+            margin: 15% auto;
             padding: 20px;
             border: 1px solid #888;
-            width: 80%; /* Could be more or less, depending on screen size */
+            width: 80%;
+            max-width: 450px;
             text-align: center;
             border-radius: 10px;
         }
@@ -408,429 +364,202 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['place_order'])) {
             float: right;
             font-size: 28px;
             font-weight: bold;
-        }
-
-        .close:hover,
-        .close:focus {
-            color: black;
-            text-decoration: none;
             cursor: pointer;
         }
 
-        button {
-            padding: 10px 20px;
-            margin: 10px;
-            border: none;
-            background-color: #000;
-            color: #fff;
-            cursor: pointer;
-            border-radius: 5px;
-            font-size: 16px;
+        footer .footer-content span {
+            font-weight: 200;
+            font-style: italic;
+            color: #828282;
+            font-size: 12px;
         }
 
-        button:hover {
-            background-color: #555;
+        footer .social-icons img {
+            height: 30px;
         }
 
-        .upload-form {
-            margin: 20px;
-            background-color: #FCF7F0;
-            padding: 20px;
-            border-radius: 10px;
-            box-shadow: 0 0 5px rgba(0, 0, 0, 0.1);
-        }
-
-        .upload-form input[type="file"] {
-            margin: 10px 0;
-        }
-
-        .alert-message {
-            display: none; /* Hidden by default */
-            position: fixed; /* Stay in place */
-            z-index: 1000; /* Sit on top */
-            left: 0;
-            top: 0;
-            width: 100%; /* Full width */
-            height: 100%; /* Full height */
-            background-color: rgba(0, 0, 0, 0.5); /* Black w/ opacity */
-            justify-content: center; /* Center horizontally */
-            align-items: center; /* Center vertically */
-        }
-
-        .alert-content {
-            background-color: #fefefe;
-            padding: 20px;
-            border-radius: 10px;
-            text-align: center;
-            box-shadow: 0 4px 8px rgba(0, 0, 0, 0.2);
-            width: 80%; /* Responsive width */
-            max-width: 400px; /* Max width */
-        }
-
-        .alert-content h2 {
-            margin: 0;
-            font-size: 20px;
-            font-weight: bold;
-        }
-
-        .alert-content button {
-            margin-top: 20px;
-            background-color: #C80000; /* Alert button color */
-            color: #fff;
-            border: none;
-            padding: 10px 20px;
-            cursor: pointer;
-            border-radius: 5px;
-        }
-
-        .alert-content button:hover {
-            background-color: #a00000; /* Darker on hover */
+        @media (max-width: 900px) {
+            .checkout-layout {
+                grid-template-columns: 1fr;
+            }
         }
 
         @media (max-width: 768px) {
             header nav ul {
-                flex-wrap: wrap; /* Allow items to wrap instead of stacking */
-                justify-content: center; /* Center items in the navbar */
+                flex-wrap: wrap;
+                justify-content: center;
             }
-        
+
             header nav ul li {
-                margin-left: 5px; /* Adjust spacing for smaller screens */
-                margin-right: 5px; /* Add right margin for spacing */
+                margin: 0 5px;
             }
-        
-            header nav ul li a {
-                font-size: 15px; /* Smaller font size for mobile */
+
+            .product-item {
+                grid-template-columns: 24px 60px 1fr;
             }
-        }
-        
-        @media (max-width: 480px) {
-            header nav ul li {
-                margin-left: 5px; /* Further adjust spacing */
-                margin-right: 5px; /* Add right margin for spacing */
+
+            .quantity-input,
+            .product-price,
+            .remove-button {
+                grid-column: 3;
+                justify-self: start;
             }
-        
-            header nav ul li a {
-                font-size: 11px; /* Ensure font size is small */
-            }
-        
-            .content h1 {
-                font-size: 24px; /* Reduce heading size */
-            }
-        
-            .content p {
-                font-size: 14px; /* Smaller font size */
-            }
-        
-            .footer-content span {
-                font-size: 10px; /* Smaller footer text */
-            }
-        }
-        
-        @media (max-width: 360px) {
-            header nav ul li {
-                margin-left: 5px; /* Further adjust spacing */
-                margin-right: 5px; /* Add right margin for spacing */
-            }
-        
-            header nav ul li a {
-                font-size: 11px; /* Ensure font size is small */
-            }
-        
-            .content h1 {
-                font-size: 20px; /* Reduce heading size */
-            }
-        
-            .content p {
-                font-size: 10px; /* Smaller font size */
-            }
-        
-            .footer-content span {
-                font-size: 7px; /* Smaller footer text */
+
+            .address-grid {
+                grid-template-columns: 1fr;
             }
         }
     </style>
 </head>
 <body>
-    <header>
-        <div class="logo">
-            <a href="index.php"><img src="assets/images/Logo.png" alt="Siti Cookies"></a>
-        </div>
-        <nav>
-            <ul>
-                <li><a href="index.php">Home</a></li>
-                <li><a href="Shop.php">Products</a></li>
-                <li><a href="Checkout.php" style="color:#C80000">Cart</a></li>
-                <?php if (isset($_SESSION['username'])): ?>
-                <li class="dropdown">
-                    <a href="javascript:void(0)" class="login-signup"><?php echo htmlspecialchars($_SESSION['username']); ?></a>
-                    <div class="dropdown-content">
-                        <a href="Profile.php">Profile</a>
-                        <a href="javascript:void(0)" onclick="confirmLogout()">Logout</a>
-                    </div>
-                </li>
-                <?php else: ?>
-                <li><a href="LoginSignup.php" class="login-signup">Login / SignUp</a></li>
-                <?php endif; ?>
-            </ul>
-        </nav>
-        <div id="logoutModal" class="modal">
-            <div class="modal-content">
-                <span class="close" onclick="closeModal()">&times;</span>
-                <h2>Are you sure you want to logout?</h2>
-                <button onclick="logout()">Yes</button>
-                <button onclick="closeModal()">No</button>
-            </div>
-        </div>
-    </header>
-    <main>
-        <h2 class="checkout-title">CHECK OUT</h2>
-        <div class="products">
-            <?php if (isset($_SESSION['cart']) && count($_SESSION['cart']) > 0): ?>
-                <?php foreach ($_SESSION['cart'] as $index => $item): ?>
-                    <div class="product-item" id="product<?php echo $index; ?>">
-                        <input type="checkbox" checked onchange="toggleProduct('product<?php echo $index; ?>')">
-                        <img src="<?php echo htmlspecialchars('assets/images/' . basename($item['image'])); ?>" alt="<?php echo htmlspecialchars($item['name_product']); ?>">
-                        <div class="product-info">
-                            <div class="product-title"><?php echo htmlspecialchars($item['name_product']); ?></div>
-                            <div class="product-description"><?php echo htmlspecialchars($item['short_desc']); ?></div>
-                        </div>
-                        <div class="product-price">RM<?php echo number_format($item['price'], 2); ?></div>
-                        <div class="quantity-input">
-                            <button onclick="decrementQuantity('<?php echo $index; ?>')">-</button>
-                            <input type="number" value="1" min="1" onchange="updateOrderSummary()">
-                            <button onclick="incrementQuantity('<?php echo $index; ?>')">+</button>
-                            <button onclick="removeFromCart('<?php echo $item['id']; ?>')">Remove</button>
-                        </div>
-                    </div>
-                <?php endforeach; ?>
-            <?php else: ?>
-                <p>No items in the cart.</p>
-            <?php endif; ?>
-        </div>
-        <div class="order-summary">
-            <h3>Order summary</h3>
-            <div>
-                <span>Subtotal</span>
-                <span id="subtotal">RM0.00</span>
-            </div>
-            <div>
-                <span>Shipping</span>
-                <span>RM4.90</span>
-            </div>
-            <div>
-                <span>Tax</span>
-                <span>RM1.00</span>
-            </div>
-            <div>
-                <span><strong>Total</strong></span>
-                <strong><span id="total">RM0.00</span></strong>
-            </div>
-            <button class="continue-btn" onclick="continueToPayment()">Place Order</button>
-        </div>
-        <div class="address">
-            <input type="text" id="address" placeholder="Address">
-            <input type="text" id="state" placeholder="State">
-            <input type="text" id="postcode" placeholder="Postcode">
-            <input type="text" id="city" placeholder="City">
-        </div>
-        <div class="payment-method">
-            <label>
-                <input type="radio" name="payment" value="Cash On Delivery" id="cash" checked>
-                Cash on Delivery
-            </label>
-            <label>
-                <input type="radio" name="payment" value="Online Banking" id="online">
-                Online Banking
-            </label>
-        </div>
-        
-    <div class="instructions">
-    <h2>Online Banking Payment Instructions</h2>
-    <p>Please follow the steps below to complete your payment:</p>
-    <ol>
-        <li>Log in to your online banking account through your bank's official website or mobile app.</li>
-        <li>Navigate to the 'Transfer' or 'Payments' section. This may vary slightly depending on your bank.</li>
-        <li>Initiate a new transfer and enter the payment details as follows:</li>
-        <ul>
-            <li><strong>Bank Name:</strong> Maybank</li>
-            <li><strong>Account Number:</strong> 123456789</li>
-            <li><strong>Account Holder Name:</strong> Siti Cookies Shop</li>
-        </ul>
-        <li>Double-check the entered details to ensure they are correct. Any mistakes may delay the processing of your order.</li>
-        <li>Enter the total amount of your purchase. Make sure this matches the amount shown on your order confirmation.</li>
-        <li>Review the details of your transfer and confirm the payment. Note down the transaction reference number for your records.</li>
-        <li>Take a screenshot or save a copy of your transfer receipt. This will be needed for verification purposes.</li>
-    </ol>
-    <p>After completing the transfer, please upload your receipt using the form below. Make sure the receipt clearly shows the following details:</p>
-    <ul>
-        <li>The transaction reference number</li>
-        <li>The date of the transaction</li>
-        <li>The amount transferred</li>
-        <li>The account holder's name (Siti Cookies Shop)</li>
-    </ul>
-    <p>Upload your receipt using the form below:</p>
-        <div class="upload-form">
-            <form id="uploadForm" method="post" enctype="multipart/form-data">
-                <label for="receipt">Upload Receipt:</label>
-                <input type="file" name="receipt" id="receipt" required>
-            </form>
-        </div>
-    </div>
-        <form id="checkout-form" action="" method="POST" enctype="multipart/form-data">
-            <input type="hidden" name="subtotal" id="hidden-subtotal" value="">
-            <input type="hidden" name="total" id="hidden-total" value="">
-            <input type="hidden" name="address" id="hidden-address" value="">
-            <input type="hidden" name="state" id="hidden-state" value="">
-            <input type="hidden" name="postcode" id="hidden-postcode" value="">
-            <input type="hidden" name="city" id="hidden-city" value="">
-            <input type="hidden" name="payment" id="hidden-payment" value="">
-            <input type="hidden" name="receipt" id="hidden-receipt" value="">
-            <input type="hidden" name="place_order" value="1">
-        </form>
-    </main>
-    <footer>
-        <div class="footer-content">
-            <img src="assets/images/Logo.png" alt="Siti Cookies">
-            <span>Copyright @2024 Siti Cookies</span>
-            <div class="social-icons">
-                <a href="https://www.facebook.com/share/QxLx6VcdovGtKxer/?mibextid=LQQJ4d"><img src="assets/images/facebook.png" alt="Facebook"></a>
-                <a href="https://www.instagram.com/sitizaleha9278?igsh=MXFiNWI2ZHFsOThyZw=="><img src="assets/images/instagram.png" alt="Instagram"></a>
-                <br>
-                <a href="FAQ.php"><span style="font-weight: 900; font-size: 15px;">FAQ</span></a>
-            </div>
-        </div>
-    </footer>
-        <script>
-            function toggleProduct(productId) {
-                const productItem = document.getElementById(productId);
-                productItem.classList.toggle('product-checked');
-                updateOrderSummary();
-            }
-        
-            function updateOrderSummary() {
-                let subtotal = 0;
-                const productItems = document.querySelectorAll('.product-item');
-                productItems.forEach(item => {
-                    const checkbox = item.querySelector('input[type="checkbox"]');
-                    if (checkbox.checked) {
-                        const price = parseFloat(item.querySelector('.product-price').innerText.replace('RM', ''));
-                        const quantity = parseInt(item.querySelector('.quantity-input input').value);
-                        subtotal += price * quantity;
-                    }
-                });
-                document.getElementById('subtotal').innerText = 'RM' + subtotal.toFixed(2);
-                const shipping = 4.90;
-                const tax = 1.00;
-                const total = subtotal + shipping + tax;
-                document.getElementById('total').innerText = 'RM' + total.toFixed(2);
-                document.getElementById('hidden-subtotal').value = subtotal.toFixed(2);
-                document.getElementById('hidden-total').value = total.toFixed(2);
-            }
-        
-            function incrementQuantity(index) {
-                const quantityInput = document.querySelector(`#product${index} .quantity-input input`);
-                quantityInput.value = parseInt(quantityInput.value) + 1;
-                updateOrderSummary();
-            }
-        
-            function decrementQuantity(index) {
-                const quantityInput = document.querySelector(`#product${index} .quantity-input input`);
-                if (quantityInput.value > 1) {
-                    quantityInput.value = parseInt(quantityInput.value) - 1;
-                    updateOrderSummary();
-                }
-            }
-        
-            function removeFromCart(productId) {
-                if (confirm("Are you sure you want to remove this item from the cart?")) {
-                    window.location.href = "?remove_id=" + productId;
-                }
-            }
-            
-            function validateCart() {
-                // This function should be adapted based on how your cart is structured.
-                var cartItems = document.querySelectorAll('.product-item input[type="checkbox"]');
-                var cartNotEmpty = false;
-            
-                cartItems.forEach(function(item) {
-                    if (item.checked) {
-                        cartNotEmpty = true;
-                    }
-                });
-            
-                return cartNotEmpty;
-            }
-        
-            function continueToPayment() {
-                <?php if (!isset($_SESSION['username'])): ?>
-                    alert("Please log in to proceed.");
-                    window.location.href = "LoginSignup.php";
-                    return false;
-                <?php endif; ?>
-            
-                // Check if cart is not empty
-                if (!validateCart()) {
-                    alert('Your cart is empty. Please add items to your cart before placing an order.');
-                    return;
-                }
-            
-                const address = document.getElementById('address').value;
-                const state = document.getElementById('state').value;
-                const postcode = document.getElementById('postcode').value;
-                const city = document.getElementById('city').value;
-                const payment = document.querySelector('input[name="payment"]:checked').value;
-            
-                if (!address || !state || !postcode || !city) {
-                    alert('Please fill in all address fields.');
-                    return;
-                }
-            
-                document.getElementById('hidden-address').value = address;
-                document.getElementById('hidden-state').value = state;
-                document.getElementById('hidden-postcode').value = postcode;
-                document.getElementById('hidden-city').value = city;
-                document.getElementById('hidden-payment').value = payment;
-                document.getElementById('checkout-form').submit();
-            }
-            
-            function confirmLogout() {
-                document.getElementById('logoutModal').style.display = 'block';
-            }
-        
-            function closeModal() {
-                document.getElementById('logoutModal').style.display = 'none';
-            }
-        
-            function logout() {
-                window.location.href = 'actions/logout.php';
-            }
-            
-            function toggleInstructions() {
-                const onlineChecked = document.getElementById('online').checked;
-                const instructions = document.querySelector('.instructions');
-                instructions.style.display = onlineChecked ? 'block' : 'none';
-            }
-        
-            // Add event listeners to radio buttons
-            document.getElementById('cash').addEventListener('change', toggleInstructions);
-            document.getElementById('online').addEventListener('change', toggleInstructions);
-        
-            // Add event listeners to checkboxes to update the order summary when their state changes
-            document.querySelectorAll('input[type="checkbox"]').forEach(checkbox => {
-                checkbox.addEventListener('change', updateOrderSummary);
-            });
-        
-            // Add event listeners to quantity inputs to update the order summary when their values change
-            document.querySelectorAll('.quantity-input input').forEach((input, index) => {
-                input.addEventListener('change', () => updateOrderSummary(index));
-            });
-        
-            // Call once to set initial state
-            toggleInstructions();
-        
-            // Initial order summary update
-            updateOrderSummary();
-        </script>
+    <?php render_site_header('cart'); ?>
+    <?php render_flash(); ?>
 
+    <main class="checkout-layout">
+        <section class="panel">
+            <h2>Check Out</h2>
+            <?php if ($cartItems !== []): ?>
+                <form id="checkout-form" method="POST" enctype="multipart/form-data">
+                    <?php foreach ($cartItems as $index => $item): ?>
+                        <div class="product-item" data-product-id="<?= (int) $item['id']; ?>" data-price="<?= number_format((float) $item['price'], 2, '.', ''); ?>">
+                            <input type="checkbox" class="item-select" checked>
+                            <img src="assets/images/<?= h(basename($item['image'])); ?>" alt="<?= h($item['name_product']); ?>">
+                            <div>
+                                <div><strong><?= h($item['name_product']); ?></strong></div>
+                                <div class="product-description"><?= h($item['short_desc']); ?></div>
+                                <div class="product-description">Stock available: <?= (int) $item['stock']; ?></div>
+                            </div>
+                            <div class="product-price">RM<?= number_format((float) $item['price'], 2); ?></div>
+                            <div class="quantity-input">
+                                <button type="button" class="quantity-button" onclick="changeQuantity(<?= $index; ?>, -1)">-</button>
+                                <input type="number" class="quantity-field" value="<?= (int) $item['quantity']; ?>" min="1" max="<?= (int) $item['stock']; ?>">
+                                <button type="button" class="quantity-button" onclick="changeQuantity(<?= $index; ?>, 1)">+</button>
+                                <a class="remove-button" href="Checkout.php?remove_id=<?= (int) $item['id']; ?>">Remove</a>
+                            </div>
+                        </div>
+                    <?php endforeach; ?>
+
+                    <div class="address-grid">
+                        <input type="text" name="address" placeholder="Address" required>
+                        <input type="text" name="state" placeholder="State" required>
+                        <input type="text" name="postcode" placeholder="Postcode" required>
+                        <input type="text" name="city" placeholder="City" required>
+                    </div>
+
+                    <div class="payment-method">
+                        <label><input type="radio" name="payment" value="Cash On Delivery" checked> Cash on Delivery</label>
+                        <label><input type="radio" name="payment" value="Online Banking"> Online Banking</label>
+                    </div>
+
+                    <div class="instructions" id="banking-instructions">
+                        <h3>Online Banking Payment Instructions</h3>
+                        <p>Transfer to Maybank account 123456789 under Siti Cookies Shop, then upload your receipt below.</p>
+                        <div class="upload-group">
+                            <input type="file" name="receipt" accept=".jpg,.jpeg,.png,.pdf">
+                        </div>
+                    </div>
+
+                    <input type="hidden" name="cart_state" id="cart-state">
+                    <input type="hidden" name="place_order" value="1">
+                </form>
+            <?php else: ?>
+                <p>Your cart is empty. Add some cookies from the products page first.</p>
+            <?php endif; ?>
+        </section>
+
+        <aside class="panel">
+            <h3>Order Summary</h3>
+            <div class="summary-row"><span>Subtotal</span><span id="subtotal">RM0.00</span></div>
+            <div class="summary-row"><span>Shipping</span><span id="shipping">RM0.00</span></div>
+            <div class="summary-row"><span>Tax</span><span id="tax">RM0.00</span></div>
+            <div class="summary-row"><strong>Total</strong><strong id="total">RM0.00</strong></div>
+            <?php if ($cartItems !== []): ?>
+                <button type="button" class="continue-btn" onclick="submitCheckout()">Place Order</button>
+            <?php endif; ?>
+        </aside>
+    </main>
+
+    <?php render_site_footer('FAQ.php'); ?>
+    <?php render_logout_script(); ?>
+
+    <script>
+        const shippingFee = 4.90;
+        const taxFee = 1.00;
+
+        function getItems() {
+            return Array.from(document.querySelectorAll('.product-item'));
+        }
+
+        function changeQuantity(index, delta) {
+            const item = getItems()[index];
+            const input = item.querySelector('.quantity-field');
+            const min = parseInt(input.min, 10);
+            const max = parseInt(input.max, 10);
+            const next = Math.max(min, Math.min(max, parseInt(input.value, 10) + delta));
+            input.value = next;
+            updateOrderSummary();
+        }
+
+        function updateOrderSummary() {
+            let subtotal = 0;
+
+            getItems().forEach((item) => {
+                const checked = item.querySelector('.item-select').checked;
+                const price = parseFloat(item.dataset.price);
+                const quantity = Math.max(1, parseInt(item.querySelector('.quantity-field').value, 10) || 1);
+                item.querySelector('.quantity-field').value = quantity;
+
+                if (checked) {
+                    subtotal += price * quantity;
+                }
+            });
+
+            const hasSelectedItems = subtotal > 0;
+            const shipping = hasSelectedItems ? shippingFee : 0;
+            const tax = hasSelectedItems ? taxFee : 0;
+            const total = subtotal + shipping + tax;
+
+            document.getElementById('subtotal').innerText = 'RM' + subtotal.toFixed(2);
+            document.getElementById('shipping').innerText = 'RM' + shipping.toFixed(2);
+            document.getElementById('tax').innerText = 'RM' + tax.toFixed(2);
+            document.getElementById('total').innerText = 'RM' + total.toFixed(2);
+            document.getElementById('cart-state').value = JSON.stringify(buildCartState());
+        }
+
+        function buildCartState() {
+            return getItems().map((item) => ({
+                product_id: parseInt(item.dataset.productId, 10),
+                quantity: Math.max(1, parseInt(item.querySelector('.quantity-field').value, 10) || 1),
+                selected: item.querySelector('.item-select').checked,
+            }));
+        }
+
+        function toggleInstructions() {
+            const onlineBanking = document.querySelector('input[name="payment"][value="Online Banking"]').checked;
+            document.getElementById('banking-instructions').style.display = onlineBanking ? 'block' : 'none';
+        }
+
+        function submitCheckout() {
+            const selectedItem = buildCartState().some((item) => item.selected);
+            if (!selectedItem) {
+                alert('Please select at least one item.');
+                return;
+            }
+
+            updateOrderSummary();
+            document.getElementById('checkout-form').submit();
+        }
+
+        document.querySelectorAll('.item-select, .quantity-field').forEach((element) => {
+            element.addEventListener('change', updateOrderSummary);
+        });
+
+        document.querySelectorAll('input[name="payment"]').forEach((element) => {
+            element.addEventListener('change', toggleInstructions);
+        });
+
+        toggleInstructions();
+        updateOrderSummary();
+    </script>
 </body>
 </html>
