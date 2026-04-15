@@ -67,6 +67,16 @@ password_resets
 -Add order history feature
 -Improve UI/UX design
 
-```text
-assets/screenshots/home.png
-assets/screenshots/admin-dashboard.png
+## 📸 Screenshots
+
+### 🏠 Homepage
+![Homepage](assets/screenshots/home.png)
+
+### 🛍️ Product Page
+![Product](assets/screenshots/product.png)
+
+### 📊 Admin Dashboard
+![Dashboard](assets/screenshots/admin-dashboard.png)
+
+### 📦 Admin Orders
+![Orders](assets/screenshots/admin-order.png)
