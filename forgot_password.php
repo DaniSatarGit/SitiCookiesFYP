@@ -1,71 +1,47 @@
 <?php
-// Start the session
-session_start();
+require_once __DIR__ . '/includes/bootstrap.php';
 
-// Include database connection file
-require_once __DIR__ . "/config/db_connection.php";
+$email = '';
+$email_err = '';
 
-// Define variables and initialize with empty values
-$email = $email_err = "";
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    $email = trim($_POST['email'] ?? '');
 
-// Processing form data when form is submitted
-if ($_SERVER["REQUEST_METHOD"] == "POST") {
-
-    // Validate email
-    if (empty(trim($_POST["email"]))) {
-        $email_err = "Please enter an email address.";
+    if ($email === '' || !filter_var($email, FILTER_VALIDATE_EMAIL)) {
+        $email_err = 'Please enter a valid email address.';
     } else {
-        $email = trim($_POST["email"]);
+        $stmt = $conn->prepare('SELECT email FROM userdata WHERE email = ? LIMIT 1');
+        $stmt->bind_param('s', $email);
+        $stmt->execute();
+        $stmt->store_result();
 
-        // Check if email exists in the database
-        $sql = "SELECT email FROM userdata WHERE email = ?";
-        if ($stmt = $conn->prepare($sql)) {
-            $stmt->bind_param("s", $param_email);
-            $param_email = $email;
+        if ($stmt->num_rows === 1) {
+            $token = bin2hex(random_bytes(50));
+            $insert_stmt = $conn->prepare('INSERT INTO password_resets (email, token) VALUES (?, ?)');
+            $insert_stmt->bind_param('ss', $email, $token);
 
-            if ($stmt->execute()) {
-                $stmt->store_result();
+            if ($insert_stmt->execute()) {
+                $reset_link = "http://yourdomain.com/reset_password.php?token=$token";
+                $subject = 'Password Reset';
+                $message = "Click on the following link to reset your password: $reset_link";
+                $headers = 'From: no-reply@yourdomain.com';
 
-                if ($stmt->num_rows == 1) {
-                    // Email exists, generate a unique token
-                    $token = bin2hex(random_bytes(50));
-                    $sql_insert = "INSERT INTO password_resets (email, token) VALUES (?, ?)";
-
-                    if ($stmt_insert = $conn->prepare($sql_insert)) {
-                        $stmt_insert->bind_param("ss", $param_email, $param_token);
-                        $param_email = $email;
-                        $param_token = $token;
-
-                        if ($stmt_insert->execute()) {
-                            // Send email
-                            $reset_link = "http://yourdomain.com/reset_password.php?token=$token";
-                            $to = $email;
-                            $subject = "Password Reset";
-                            $message = "Click on the following link to reset your password: $reset_link";
-                            $headers = "From: no-reply@yourdomain.com";
-
-                            if (mail($to, $subject, $message, $headers)) {
-                                echo '<script>alert("Password reset link has been sent to your email."); window.location.href = "LoginSignup.php";</script>';
-                            } else {
-                                echo "Failed to send email.";
-                            }
-                        } else {
-                            echo "Something went wrong. Please try again later.";
-                        }
-                        $stmt_insert->close();
-                    }
+                if (mail($email, $subject, $message, $headers)) {
+                    echo '<script>alert("Password reset link has been sent to your email."); window.location.href = "LoginSignup.php";</script>';
                 } else {
-                    $email_err = "No account found with that email.";
+                    echo 'Failed to send email.';
                 }
             } else {
-                echo "Oops! Something went wrong. Please try again later.";
+                echo 'Something went wrong. Please try again later.';
             }
-            $stmt->close();
-        }
-    }
 
-    // Close connection
-    $conn->close();
+            $insert_stmt->close();
+        } else {
+            $email_err = 'No account found with that email.';
+        }
+
+        $stmt->close();
+    }
 }
 ?>
 
@@ -79,9 +55,9 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
 <body>
     <div class="auth-container">
         <h2><center>Forgot Password</center></h2>
-        <form action="<?php echo htmlspecialchars($_SERVER["PHP_SELF"]); ?>" method="post">
+        <form action="<?php echo h($_SERVER['PHP_SELF']); ?>" method="post">
             <input type="email" name="email" placeholder="Enter your email" required>
-            <span><?php echo $email_err; ?></span>
+            <span><?php echo h($email_err); ?></span>
             <button type="submit">Submit</button>
         </form>
     </div>

@@ -1,91 +1,61 @@
 <?php
-// Start the session
-session_start();
+require_once __DIR__ . '/includes/bootstrap.php';
 
-// Include database connection file
-require_once __DIR__ . "/config/db_connection.php";
-
-// Define variables and initialize with empty values
-$password = $reenter_password = "";
-$password_err = $reenter_password_err = "";
-
-// Get token from URL
+$password = '';
+$reenter_password = '';
+$password_err = '';
+$reenter_password_err = '';
+$email = '';
 $token = $_GET['token'] ?? '';
 
-// Check if token is valid
-$sql = "SELECT email FROM password_resets WHERE token = ?";
-if ($stmt = $conn->prepare($sql)) {
-    $stmt->bind_param("s", $param_token);
-    $param_token = $token;
+$stmt = $conn->prepare('SELECT email FROM password_resets WHERE token = ? LIMIT 1');
+$stmt->bind_param('s', $token);
+$stmt->execute();
+$stmt->store_result();
 
-    if ($stmt->execute()) {
-        $stmt->store_result();
-
-        if ($stmt->num_rows == 1) {
-            $stmt->bind_result($email);
-            $stmt->fetch();
-        } else {
-            echo "Invalid or expired token.";
-            exit();
-        }
-    } else {
-        echo "Oops! Something went wrong. Please try again later.";
-        exit();
-    }
+if ($stmt->num_rows !== 1) {
     $stmt->close();
+    exit('Invalid or expired token.');
 }
 
-// Processing form data when form is submitted
-if ($_SERVER["REQUEST_METHOD"] == "POST") {
+$stmt->bind_result($email);
+$stmt->fetch();
+$stmt->close();
 
-    // Validate password
-    if (empty(trim($_POST["password"]))) {
-        $password_err = "Please enter a password.";
-    } elseif (strlen(trim($_POST["password"])) < 6) {
-        $password_err = "Password must have at least 6 characters.";
-    } else {
-        $password = trim($_POST["password"]);
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    $password = trim($_POST['password'] ?? '');
+    $reenter_password = trim($_POST['reenter_password'] ?? '');
+
+    if ($password === '') {
+        $password_err = 'Please enter a password.';
+    } elseif (strlen($password) < 6) {
+        $password_err = 'Password must have at least 6 characters.';
     }
 
-    // Validate re-entered password
-    if (empty(trim($_POST["reenter_password"]))) {
-        $reenter_password_err = "Please re-enter your password.";
-    } else {
-        $reenter_password = trim($_POST["reenter_password"]);
-        if ($password != $reenter_password) {
-            $reenter_password_err = "Passwords did not match.";
+    if ($reenter_password === '') {
+        $reenter_password_err = 'Please re-enter your password.';
+    } elseif ($password !== $reenter_password) {
+        $reenter_password_err = 'Passwords did not match.';
+    }
+
+    if ($password_err === '' && $reenter_password_err === '') {
+        $password_hash = password_hash($password, PASSWORD_DEFAULT);
+        $update_stmt = $conn->prepare('UPDATE userdata SET password = ? WHERE email = ?');
+        $update_stmt->bind_param('ss', $password_hash, $email);
+
+        if ($update_stmt->execute()) {
+            $delete_stmt = $conn->prepare('DELETE FROM password_resets WHERE token = ?');
+            $delete_stmt->bind_param('s', $token);
+            $delete_stmt->execute();
+            $delete_stmt->close();
+
+            echo '<script>alert("Password reset successful. Please login."); window.location.href = "LoginSignup.php";</script>';
+        } else {
+            echo 'Something went wrong. Please try again later.';
         }
+
+        $update_stmt->close();
     }
-
-    // Check input errors before updating the password in the database
-    if (empty($password_err) && empty($reenter_password_err)) {
-
-        // Prepare an update statement
-        $sql_update = "UPDATE userdata SET password = ? WHERE email = ?";
-        if ($stmt_update = $conn->prepare($sql_update)) {
-            $stmt_update->bind_param("ss", $param_password, $param_email);
-            $param_password = $password;
-            $param_email = $email;
-
-            if ($stmt_update->execute()) {
-                // Delete the token from password_resets table
-                $sql_delete = "DELETE FROM password_resets WHERE token = ?";
-                if ($stmt_delete = $conn->prepare($sql_delete)) {
-                    $stmt_delete->bind_param("s", $param_token);
-                    $param_token = $token;
-                    $stmt_delete->execute();
-                }
-
-                echo '<script>alert("Password reset successful. Please login."); window.location.href = "LoginSignup.php";</script>';
-            } else {
-                echo "Something went wrong. Please try again later.";
-            }
-            $stmt_update->close();
-        }
-    }
-
-    // Close connection
-    $conn->close();
 }
 ?>
 
@@ -99,11 +69,11 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
 <body>
     <div class="auth-container">
         <h2><center>Reset Password</center></h2>
-        <form action="<?php echo htmlspecialchars($_SERVER["PHP_SELF"]); ?>?token=<?php echo htmlspecialchars($token); ?>" method="post">
+        <form action="<?php echo h($_SERVER['PHP_SELF']); ?>?token=<?php echo h($token); ?>" method="post">
             <input type="password" name="password" placeholder="Enter new password" required>
-            <span><?php echo $password_err; ?></span>
+            <span><?php echo h($password_err); ?></span>
             <input type="password" name="reenter_password" placeholder="Re-enter new password" required>
-            <span><?php echo $reenter_password_err; ?></span>
+            <span><?php echo h($reenter_password_err); ?></span>
             <button type="submit">Submit</button>
         </form>
     </div>

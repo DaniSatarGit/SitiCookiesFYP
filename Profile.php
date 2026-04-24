@@ -1,51 +1,38 @@
 <?php
-session_start();
+require_once __DIR__ . '/includes/bootstrap.php';
 
-// Database connection
-include __DIR__ . '/config/db_connection.php';
-
-// Create connection
-$conn = new mysqli($servername, $username, $password, $dbname);
-
-// Check connection
-if ($conn->connect_error) {
-    die("Connection failed: " . $conn->connect_error);
-}
-
-// Fetch user data
 $user_email = '';
 $user_password_hash = '';
-if (isset($_SESSION['username'])) {
-    $stmt = $conn->prepare("SELECT email, password FROM userdata WHERE username = ?");
-    $stmt->bind_param("s", $_SESSION['username']);
+$profile_alert = '';
+
+if (is_logged_in()) {
+    $username = (string) current_user();
+    $stmt = $conn->prepare('SELECT email, password FROM userdata WHERE username = ?');
+    $stmt->bind_param('s', $username);
     $stmt->execute();
     $stmt->bind_result($user_email, $user_password_hash);
     $stmt->fetch();
     $stmt->close();
 }
 
-// Change password logic
-if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['change_password'])) {
-    $old_password = $_POST['old_password'];
-    $new_password = $_POST['new_password'];
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['change_password'])) {
+    $old_password = $_POST['old_password'] ?? '';
+    $new_password = $_POST['new_password'] ?? '';
 
-    // Verify the old password
-    if (password_verify($old_password, $user_password_hash)) {
-        // Hash the new password
+    if (!is_logged_in()) {
+        $profile_alert = 'Please log in before changing your password.';
+    } elseif (password_verify($old_password, $user_password_hash)) {
         $new_password_hash = password_hash($new_password, PASSWORD_DEFAULT);
-
-        // Update the password in the database
-        $update_stmt = $conn->prepare("UPDATE userdata SET password = ? WHERE username = ?");
-        $update_stmt->bind_param("ss", $new_password_hash, $_SESSION['username']);
+        $username = (string) current_user();
+        $update_stmt = $conn->prepare('UPDATE userdata SET password = ? WHERE username = ?');
+        $update_stmt->bind_param('ss', $new_password_hash, $username);
         $update_stmt->execute();
         $update_stmt->close();
-        echo "<script>alert('Password changed successfully!');</script>";
+        $profile_alert = 'Password changed successfully!';
     } else {
-        echo "<script>alert('Old password is incorrect.');</script>";
+        $profile_alert = 'Old password is incorrect.';
     }
 }
-
-$conn->close();
 ?>
 
 <!DOCTYPE html>
@@ -344,9 +331,9 @@ $conn->close();
                 <li><a href="index.php">Home</a></li>
                 <li><a href="Shop.php">Products</a></li>
                 <li><a href="Checkout.php">Cart</a></li>
-                <?php if (isset($_SESSION['username'])): ?>
+                <?php if (is_logged_in()): ?>
                     <li class="dropdown">
-                        <a href="javascript:void(0)" class="login-signup"><?php echo htmlspecialchars($_SESSION['username']); ?></a>
+                        <a href="javascript:void(0)" class="login-signup"><?php echo h((string) current_user()); ?></a>
                         <div class="dropdown-content">
                             <a href="Profile.php">Profile</a>
                             <a href="javascript:void(0)" onclick="confirmLogout()">Logout</a>
@@ -362,8 +349,8 @@ $conn->close();
         <div class="content">
             <h1>User Profile</h1>
             <div class="profile-info">
-                <p><strong>Username:</strong> <?php echo isset($_SESSION['username']) ? htmlspecialchars($_SESSION['username']) : 'Guest'; ?></p>
-                <p><strong>Email:</strong> <?php echo htmlspecialchars($user_email ? $user_email : 'Not available'); ?></p>
+                <p><strong>Username:</strong> <?php echo is_logged_in() ? h((string) current_user()) : 'Guest'; ?></p>
+                <p><strong>Email:</strong> <?php echo h($user_email ?: 'Not available'); ?></p>
             </div>
             <div id="logoutModal" class="modal">
                 <div class="modal-content">
@@ -402,6 +389,9 @@ $conn->close();
             </div>
         </div>
     </footer>
+    <?php if ($profile_alert !== ''): ?>
+        <script>alert('<?= h($profile_alert); ?>');</script>
+    <?php endif; ?>
     <script>
         function togglePassword() {
             var oldPassword = document.getElementById("old_password");
