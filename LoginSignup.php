@@ -16,6 +16,17 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         if ($username === '') {
             $usernameErr = 'Please enter a username.';
+        } else {
+            $stmt = $conn->prepare('SELECT username FROM userdata WHERE username = ? LIMIT 1');
+            $stmt->bind_param('s', $username);
+            $stmt->execute();
+            $stmt->store_result();
+
+            if ($stmt->num_rows > 0) {
+                $usernameErr = 'This username is already taken.';
+            }
+
+            $stmt->close();
         }
 
         if ($email === '' || !filter_var($email, FILTER_VALIDATE_EMAIL)) {
@@ -34,35 +45,26 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $reenterPasswordErr = 'Passwords did not match.';
         }
 
-        if ($usernameErr === '') {
-            $stmt = $conn->prepare('SELECT username FROM userdata WHERE username = ? LIMIT 1');
-            $stmt->bind_param('s', $username);
-            $stmt->execute();
-            $stmt->store_result();
+        $hasError = $usernameErr || $emailErr || $passwordErr || $reenterPasswordErr;
 
-            if ($stmt->num_rows > 0) {
-                $usernameErr = 'This username is already taken.';
-            }
-
-            $stmt->close();
-        }
-
-        if ($usernameErr === '' && $emailErr === '' && $passwordErr === '' && $reenterPasswordErr === '') {
+        if (!$hasError) {
             $hashedPassword = password_hash($password, PASSWORD_BCRYPT);
             $stmt = $conn->prepare('INSERT INTO userdata (username, email, password) VALUES (?, ?, ?)');
             $stmt->bind_param('sss', $username, $email, $hashedPassword);
+            $registered = $stmt->execute();
 
-            if ($stmt->execute()) {
+            if ($registered) {
                 set_flash('success', 'Registration successful. Please log in.');
-                $stmt->close();
-                redirect('LoginSignup.php');
+            } else {
+                set_flash('error', 'Unable to complete registration right now.');
             }
 
             $stmt->close();
-            set_flash('error', 'Unable to complete registration right now.');
             redirect('LoginSignup.php');
         }
-    } elseif (isset($_POST['login_username'], $_POST['login_password'])) {
+    }
+
+    if (isset($_POST['login_username'], $_POST['login_password'])) {
         $loginUsername = trim($_POST['login_username']);
         $loginPassword = trim($_POST['login_password']);
 
@@ -79,17 +81,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $stmt = $conn->prepare('SELECT username, password FROM userdata WHERE username = ? LIMIT 1');
         $stmt->bind_param('s', $loginUsername);
         $stmt->execute();
-        $stmt->store_result();
+        $stmt->bind_result($storedUsername, $storedPassword);
 
-        if ($stmt->num_rows === 1) {
-            $stmt->bind_result($storedUsername, $storedPassword);
-            $stmt->fetch();
-
-            if (is_string($storedPassword) && password_verify($loginPassword, $storedPassword)) {
-                login_user($storedUsername, 'customer');
-                $stmt->close();
-                redirect('index.php');
-            }
+        if ($stmt->fetch() && password_verify($loginPassword, $storedPassword)) {
+            login_user($storedUsername, 'customer');
+            $stmt->close();
+            redirect('index.php');
         }
 
         $stmt->close();
